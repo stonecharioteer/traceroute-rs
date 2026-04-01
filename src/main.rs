@@ -2,11 +2,12 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
+use std::time::Instant;
 
 enum ProbeResult {
-    Hop(Ipv4Addr),     // Type 11 - Time Exceeded
-    Reached(Ipv4Addr), // Type 3 - Destination Unreachable
-    Timeout,           // No reply
+    Hop(Ipv4Addr, Duration),     // Type 11 - Time Exceeded
+    Reached(Ipv4Addr, Duration), // Type 3 - Destination Unreachable
+    Timeout,                     // No reply
 }
 
 fn probe(target: Ipv4Addr, ttl: u32) -> std::io::Result<ProbeResult> {
@@ -24,6 +25,7 @@ fn probe(target: Ipv4Addr, ttl: u32) -> std::io::Result<ProbeResult> {
 
     // Send UDP packet to high port (33434)
     let dest = SockAddr::from(SocketAddrV4::new(target, 33434));
+    let start = Instant::now();
     send_sock.send_to(&[0u8; 32], &dest)?;
 
     // Listen for ICMP reply
@@ -35,10 +37,11 @@ fn probe(target: Ipv4Addr, ttl: u32) -> std::io::Result<ProbeResult> {
             // IP Header is first 20 bytes, source IP is at bytes 12-16
             if buf.len() >= 21 {
                 let ip = Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]);
+                let elapsed = start.elapsed();
                 match buf[20] {
-                    11 => Ok(ProbeResult::Hop(ip)),
-                    3 if ip == target => Ok(ProbeResult::Reached(ip)),
-                    3 => Ok(ProbeResult::Hop(ip)),
+                    11 => Ok(ProbeResult::Hop(ip, elapsed)),
+                    3 if ip == target => Ok(ProbeResult::Reached(ip, elapsed)),
+                    3 => Ok(ProbeResult::Hop(ip, elapsed)),
                     _ => Ok(ProbeResult::Timeout),
                 }
             } else {
@@ -52,15 +55,33 @@ fn probe(target: Ipv4Addr, ttl: u32) -> std::io::Result<ProbeResult> {
 fn main() -> std::io::Result<()> {
     // Manually set `8.8.8.8` (Google DNS) for now.
     let target: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
-    for ttl in 1..=60 {
-        let hop = probe(target, ttl)?;
-        match hop {
-            ProbeResult::Hop(ip) => println!("{:>2} {}", ttl, ip),
-            ProbeResult::Reached(ip) => {
-                println!("{:>2} {}", ttl, ip);
-                break;
+    for ttl in 1..=15 {
+        let mut reached = false;
+        let mut last_ip: Option<Ipv4Addr> = None;
+        print!("{:>2} ", ttl);
+        for _ in 0..3 {
+            match probe(target, ttl)? {
+                ProbeResult::Hop(ip, rtt) => {
+                    if last_ip != Some(ip) {
+                        print!("{} ", ip);
+                        last_ip = Some(ip)
+                    }
+                    print!("{:.3}ms ", rtt.as_secs_f64() * 1000.0)
+                }
+                ProbeResult::Reached(ip, rtt) => {
+                    if last_ip != Some(ip) {
+                        print!("{} ", ip);
+                        last_ip = Some(ip);
+                    }
+                    print!("{:.3}ms ", rtt.as_secs_f64() * 1000.0);
+                    reached = true;
+                }
+                ProbeResult::Timeout => print!("* "),
             }
-            ProbeResult::Timeout => println!("{:>2} *", ttl),
+        }
+        println!();
+        if reached {
+            break;
         }
     }
     Ok(())
